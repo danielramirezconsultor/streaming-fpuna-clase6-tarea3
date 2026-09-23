@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
-from apache_beam.testing.test_pipeline import TestPipeline
-from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_pipeline import TestPipeline as BeamTestPipeline
+from apache_beam.testing.test_stream import TestStream as BeamTestStream
 from apache_beam.testing.util import assert_that, equal_to
 from apache_beam.transforms.window import TimestampedValue
 from apache_beam.utils.windowed_value import PaneInfoTiming
@@ -39,7 +39,7 @@ class CapturePaneInfo(beam.DoFn):
 
 def _late_stream():
     return (
-        TestStream()
+        BeamTestStream()
         .advance_watermark_to(0)
         .add_elements([TimestampedValue(("m-a", 10), 5)])
         .advance_watermark_to(60)
@@ -50,7 +50,7 @@ def _late_stream():
 
 def test_teststream_accepts_late_revision_with_accumulating_panes(solution):
     options = PipelineOptions(["--streaming"])
-    with TestPipeline(options=options) as pipeline:
+    with BeamTestPipeline(options=options) as pipeline:
         output = (
             pipeline
             | _late_stream()
@@ -70,7 +70,7 @@ def test_teststream_accepts_late_revision_with_accumulating_panes(solution):
 
 def test_teststream_exposes_window_and_late_pane_metadata(solution):
     options = PipelineOptions(["--streaming"])
-    with TestPipeline(options=options) as pipeline:
+    with BeamTestPipeline(options=options) as pipeline:
         observed = (
             pipeline
             | _late_stream()
@@ -108,7 +108,7 @@ def test_same_event_id_in_same_merchant_is_emitted_once(solution):
         ("m-a", {"event_id": "dup"}),
     ]
 
-    with TestPipeline() as pipeline:
+    with BeamTestPipeline() as pipeline:
         output = (
             pipeline
             | beam.Create(events)

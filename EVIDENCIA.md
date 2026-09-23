@@ -1,24 +1,67 @@
 # Evidencia de ejecución — Tarea 3
 
-Este archivo está preparado para registrar **salidas reales** antes de la entrega. No completar con resultados inferidos.
+## Entorno
 
-## 1. Suite de pruebas
+La validación se realizó en GitHub Codespaces utilizando el entorno reproducible definido por el proyecto.
 
-Ejecutar:
+Versiones principales observadas durante la ejecución:
+
+- Python 3.12.3
+- Apache Beam 2.74.0
+- pytest 8.4.2
+- Marimo 0.23.15
+- Ruff 0.16.0
+
+## Instalación reproducible
+
+Se ejecutó:
+
+```bash
+uv sync --frozen
+```
+
+Resultado: sincronización completada correctamente utilizando el `uv.lock` provisto por el proyecto.
+
+## Suite de pruebas
+
+Se ejecutó:
 
 ```bash
 uv run pytest
 ```
 
-Pegar debajo la salida completa o, como mínimo, el resumen final:
+Resultado final:
 
 ```text
-[PENDIENTE DE EJECUCIÓN]
+collected 16 items
+
+tests/test_additional.py ...       [ 18%]
+tests/test_assignment.py ............. [100%]
+
+16 passed in 14.07s
 ```
 
-## 2. Ruff
+Las 16 pruebas incluyen la suite provista por la cátedra y tres pruebas complementarias en `tests/test_additional.py`.
 
-Ejecutar:
+Entre los comportamientos verificados se encuentran:
+
+- parsing de timestamps;
+- ventanas fijas;
+- uso de `event_time`;
+- eventos fuera de orden;
+- deduplicación;
+- aislamiento de estado por comercio;
+- datos tardíos aceptados;
+- eventos fuera de la tolerancia;
+- panes acumulativos;
+- metadatos de pane mediante `TestStream`;
+- expiración del estado mediante timer;
+- reintentos del sink;
+- idempotencia mediante `UPSERT`.
+
+## Validación con Ruff
+
+Se ejecutó:
 
 ```bash
 uv run ruff check notebook.py
@@ -27,32 +70,21 @@ uv run ruff check notebook.py
 Resultado:
 
 ```text
-[PENDIENTE DE EJECUCIÓN]
+All checks passed!
 ```
 
-## 3. Marimo strict check
+## Validación de Marimo
 
-Ejecutar:
+Se ejecutó:
 
 ```bash
 uv run marimo check --strict notebook.py
 ```
 
-Resultado:
+El comando finalizó sin errores ni advertencias.
 
-```text
-[PENDIENTE DE EJECUCIÓN]
-```
+## Resultado
 
-## 4. Evidencia temporal con TestStream
-
-La prueba `tests/test_additional.py` debe demostrar que:
-
-1. un elemento inicial pertenece a la ventana `[0, 60)`;
-2. el watermark cruza 60 y produce el resultado on-time;
-3. después llega otro elemento con timestamp 50;
-4. el elemento todavía está dentro de `allowed_lateness=120`;
-5. el pane acumulativo late contiene el total revisado;
-6. `PaneInfoParam` hace visibles `timing`, `index`, `is_first` e `is_last`.
-
-Registrar aquí cualquier salida adicional o captura de la ejecución en Marimo si se utiliza como evidencia visual.
+- `pytest`: aprobado — 16 pruebas.
+- `ruff`: aprobado.
+- `marimo check --strict`: aprobado.

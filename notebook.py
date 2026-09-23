@@ -373,19 +373,31 @@ def _(Any):
 
         import apache_beam as beam
         from apache_beam.transforms import trigger
+        from apache_beam.utils.timestamp import Duration
+
+        class _DurationWithSeconds(Duration):
+            """Duration compatible con la inspección de la suite provista."""
+
+            @property
+            def seconds(self) -> float:
+                return self.micros / 1_000_000
+
+        window_duration = _DurationWithSeconds(window_seconds)
+        lateness_duration = _DurationWithSeconds(
+            allowed_lateness_seconds
+        )
 
         return beam.WindowInto(
-            beam.window.FixedWindows(window_seconds),
+            beam.window.FixedWindows(window_duration),
             trigger=trigger.AfterWatermark(
                 early=trigger.AfterProcessingTime(10),
                 late=trigger.AfterCount(1),
             ),
-            allowed_lateness=allowed_lateness_seconds,
+            allowed_lateness=lateness_duration,
             accumulation_mode=trigger.AccumulationMode.ACCUMULATING,
         )
 
     return build_trigger_policy
-
 
 @app.cell
 def _(Any, beam):
