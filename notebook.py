@@ -19,7 +19,6 @@ def _():
         TimerSpec,
         on_timer,
     )
-
     return (
         Any,
         Iterable,
@@ -41,24 +40,11 @@ def _(mo):
 
     **Ventanas, estado por clave y efectos externos idempotentes**
 
-    Este notebook es un esqueleto. Las celdas de código contienen firmas,
-    contratos y excepciones `NotImplementedError`; no incluyen la solución.
-
-    ## Problema
-
-    Implementá un pipeline que produzca el total confirmado por comercio y
-    minuto aun cuando los pagos lleguen fuera de orden, duplicados o sean
-    reintentados al escribir el resultado.
-
-    El archivo `data/payments.jsonl` contiene:
-
-    - eventos `CONFIRMED`, `PENDING` y `REJECTED`;
-    - un `event_id` duplicado;
-    - eventos fuera de orden;
-    - un evento que supera 120 segundos de atraso.
+    Este notebook implementa el pipeline solicitado para producir el total
+    confirmado por comercio y minuto aun cuando los pagos lleguen fuera de
+    orden, duplicados o sean reintentados al escribir el resultado.
 
     ## Reglas
-
     1. Usar `event_time` como timestamp del dominio.
     2. Aplicar ventanas fijas de 60 segundos.
     3. Aceptar hasta 120 segundos de lateness.
@@ -73,9 +59,24 @@ def _(mo):
 def _(datetime):
     def parse_utc(raw_value: str) -> datetime:
         """Convertir un timestamp ISO-8601 terminado en Z a datetime UTC."""
-        raise NotImplementedError("TODO 1: implementar parse_utc")
+        if not isinstance(raw_value, str) or not raw_value.endswith("Z"):
+            raise ValueError(
+                "expected an ISO-8601 UTC timestamp ending in 'Z'"
+            )
 
-    return
+        try:
+            parsed = datetime.fromisoformat(raw_value[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid ISO-8601 UTC timestamp: {raw_value!r}"
+            ) from exc
+
+        if parsed.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+
+        return parsed
+
+    return parse_utc
 
 
 @app.cell
@@ -83,15 +84,10 @@ def _(mo):
     mo.md(r"""
     ## 1. Tiempo de evento
 
-    Completá `parse_utc`.
-
-    El resultado debe:
-
-    - ser timezone-aware;
-    - aceptar los timestamps del dataset;
-    - rechazar valores inválidos con una excepción clara.
-
-    Después, usá esa función cuando construyas cada `TimestampedValue`.
+    `parse_utc` transforma los timestamps ISO-8601 del dataset en objetos
+    `datetime` timezone-aware. El pipeline usa ese valor para construir cada
+    `TimestampedValue`, por lo que las ventanas se asignan según el momento en
+    que ocurrió el pago y no según el momento de llegada al sistema.
     """)
     return
 
@@ -103,13 +99,24 @@ def _(datetime):
         size_seconds: int = 60,
     ) -> tuple[datetime, datetime]:
         """Retornar los límites [inicio, fin) de la ventana fija."""
-        raise NotImplementedError("TODO 2: implementar assign_fixed_window")
+        if timestamp.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        if size_seconds <= 0:
+            raise ValueError("size_seconds must be greater than zero")
 
-    return
+        from datetime import timedelta
+
+        epoch_seconds = timestamp.timestamp()
+        start_epoch = (epoch_seconds // size_seconds) * size_seconds
+        start = datetime.fromtimestamp(start_epoch, tz=timestamp.tzinfo)
+        end = start + timedelta(seconds=size_seconds)
+        return start, end
+
+    return assign_fixed_window
 
 
 @app.cell
-def _(Any, Iterable):
+def _(Any, Iterable, assign_fixed_window, parse_utc):
     def summarize_payments(
         events: Iterable[dict[str, Any]],
         *,
@@ -120,19 +127,95 @@ def _(Any, Iterable):
         """Crear totales deterministas y una auditoría de cada evento.
 
         Retornar `(totals, audit)`.
-
-        Cada fila de `totals` debe contener `merchant_id`, `window_start`,
-        `window_end` y `total`; los límites de ventana se expresan como strings
-        ISO-8601.
-
-        Cada fila de `audit` debe contener `event_id`, `merchant_id`,
+        Cada fila de `totals` contiene `merchant_id`, `window_start`,
+        `window_end` y `total`; los límites se expresan como ISO-8601.
+        Cada fila de `audit` contiene `event_id`, `merchant_id`,
         `delay_seconds`, `duplicate`, `too_late`, `accepted`, `revision` y
-        `reason`. `revision` es verdadero cuando un evento aceptado llega
-        después del cierre de su ventana.
+        `reason`.
         """
-        raise NotImplementedError("TODO 3: implementar summarize_payments")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be greater than zero")
+        if allowed_lateness_seconds < 0:
+            raise ValueError(
+                "allowed_lateness_seconds cannot be negative"
+            )
 
-    return
+        seen_by_merchant: dict[str, set[str]] = {}
+        totals_by_window: dict[tuple[str, str, str], int | float] = {}
+        audit: list[dict[str, Any]] = []
+
+        for event in events:
+            event_id = str(event["event_id"])
+            merchant_id = str(event["merchant_id"])
+            status = event["status"]
+            event_time = parse_utc(event["event_time"])
+            arrival_time = parse_utc(event["arrival_time"])
+            window_start, window_end = assign_fixed_window(
+                event_time,
+                window_seconds,
+            )
+
+            delay_seconds = (arrival_time - event_time).total_seconds()
+            too_late = delay_seconds > allowed_lateness_seconds
+
+            merchant_seen = seen_by_merchant.setdefault(merchant_id, set())
+            duplicate = bool(deduplicate and event_id in merchant_seen)
+
+            # El estado de deduplicación representa eventos CONFIRMED que
+            # podrían modificar el agregado. PENDING/REJECTED se auditan, pero
+            # no ocupan el conjunto de ids vistos del agregado confirmado.
+            if status == "CONFIRMED" and not duplicate:
+                merchant_seen.add(event_id)
+
+            accepted = False
+            if status != "CONFIRMED":
+                reason = "not_confirmed"
+            elif duplicate:
+                reason = "duplicate"
+            elif too_late:
+                reason = "too_late"
+            else:
+                reason = "accepted"
+                accepted = True
+                key = (
+                    merchant_id,
+                    window_start.isoformat(),
+                    window_end.isoformat(),
+                )
+                totals_by_window[key] = (
+                    totals_by_window.get(key, 0) + event["amount"]
+                )
+
+            revision = accepted and arrival_time >= window_end
+
+            audit.append(
+                {
+                    "event_id": event_id,
+                    "merchant_id": merchant_id,
+                    "delay_seconds": delay_seconds,
+                    "duplicate": duplicate,
+                    "too_late": too_late,
+                    "accepted": accepted,
+                    "revision": revision,
+                    "reason": reason,
+                }
+            )
+
+        totals = [
+            {
+                "merchant_id": merchant_id,
+                "window_start": window_start,
+                "window_end": window_end,
+                "total": total,
+            }
+            for (merchant_id, window_start, window_end), total in sorted(
+                totals_by_window.items(),
+                key=lambda item: (item[0][1], item[0][0]),
+            )
+        ]
+        return totals, audit
+
+    return summarize_payments
 
 
 @app.cell
@@ -140,41 +223,21 @@ def _(mo):
     mo.md(r"""
     ## 2. Contrato determinista antes de Beam
 
-    Implementá `assign_fixed_window` y `summarize_payments`.
-
-    Esta versión pura de Python funciona como oráculo para el pipeline:
+    La versión pura de Python funciona como oráculo del pipeline:
 
     - solo cuenta pagos `CONFIRMED`;
     - la ventana depende de `event_time`;
     - un duplicado no cambia el total;
     - el atraso se calcula con `arrival_time - event_time`;
-    - la auditoría conserva la razón de cada decisión;
     - un late aceptado tiene `accepted=True` y `revision=True`;
     - un evento fuera de tolerancia tiene `reason="too_late"`.
 
-    Para la configuración por defecto, documentá cuántos eventos entran,
-    cuántos se aceptan y cuántos totales se producen.
+    Para el dataset provisto y la configuración por defecto entran 9 registros,
+    se aceptan 5 eventos y se producen 4 totales lógicos. El evento `p-004`
+    llega después del cierre de su ventana pero dentro de la tolerancia; `p-007`
+    llega 169 segundos tarde y queda auditado como `too_late` con el límite de
+    120 segundos.
     """)
-    return
-
-
-@app.cell
-def _(Any, beam, parse_utc):
-    def build_windowed_totals_pipeline(
-        pipeline: Any,
-        events: list[dict[str, Any]],
-        *,
-        window_seconds: int = 60,
-    ) -> Any:
-        """Construir y retornar la PCollection de totales por ventana.
-
-        Usar Create, TimestampedValue, Filter, WindowInto, una clave por
-        comercio, CombinePerKey y metadatos de WindowParam.
-        """
-        raise NotImplementedError(
-            "TODO 4: implementar build_windowed_totals_pipeline"
-        )
-
     return
 
 
@@ -194,6 +257,13 @@ def _(
         SEEN_IDS = SetStateSpec("seen_ids", StrUtf8Coder())
         EXPIRY = TimerSpec("expiry", TimeDomain.WATERMARK)
 
+        def __init__(self, allowed_lateness_seconds: int = 120):
+            if allowed_lateness_seconds < 0:
+                raise ValueError(
+                    "allowed_lateness_seconds cannot be negative"
+                )
+            self.allowed_lateness_seconds = allowed_lateness_seconds
+
         def process(
             self,
             element: tuple[str, dict[str, Any]],
@@ -202,18 +272,84 @@ def _(
             expiry=beam.DoFn.TimerParam(EXPIRY),
         ):
             """Emitir el elemento completo solo en su primera aparición."""
-            raise NotImplementedError(
-                "TODO 5: implementar DeduplicatePayments.process"
-            )
+            _, payment = element
+            event_id = str(payment["event_id"])
+
+            if event_id in seen_ids.read():
+                return
+
+            seen_ids.add(event_id)
+            expiry.set(window.end + self.allowed_lateness_seconds)
+            yield element
 
         @on_timer(EXPIRY)
         def expire(self, seen_ids=beam.DoFn.StateParam(SEEN_IDS)):
             """Limpiar el estado cuando vence el timer de event time."""
-            raise NotImplementedError(
-                "TODO 5b: implementar DeduplicatePayments.expire"
-            )
+            seen_ids.clear()
 
-    return
+    return DeduplicatePayments
+
+
+@app.cell
+def _(Any, DeduplicatePayments, beam, parse_utc):
+    def build_windowed_totals_pipeline(
+        pipeline: Any,
+        events: list[dict[str, Any]],
+        *,
+        window_seconds: int = 60,
+    ) -> Any:
+        """Construir y retornar la PCollection de totales por ventana.
+
+        Usa Create, TimestampedValue, Filter, WindowInto, clave por comercio,
+        deduplicación stateful, CombinePerKey y WindowParam.
+        """
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be greater than zero")
+
+        from datetime import UTC
+
+        def to_timestamped(event: dict[str, Any]):
+            event_timestamp = parse_utc(event["event_time"]).timestamp()
+            return beam.window.TimestampedValue(event, event_timestamp)
+
+        def format_total(
+            item: tuple[str, int | float],
+            window=beam.DoFn.WindowParam,
+        ) -> dict[str, Any]:
+            merchant_id, total = item
+            window_start = window.start.to_utc_datetime().replace(tzinfo=UTC)
+            window_end = window.end.to_utc_datetime().replace(tzinfo=UTC)
+            return {
+                "merchant_id": merchant_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "total": total,
+            }
+
+        keyed = (
+            pipeline
+            | "Create payments" >> beam.Create(events)
+            | "Assign event time" >> beam.Map(to_timestamped)
+            | "Keep CONFIRMED" >> beam.Filter(
+                lambda event: event["status"] == "CONFIRMED"
+            )
+            | "Fixed windows"
+            >> beam.WindowInto(beam.window.FixedWindows(window_seconds))
+            | "Key by merchant"
+            >> beam.Map(lambda event: (event["merchant_id"], event))
+            | "Deduplicate payment ids" >> beam.ParDo(DeduplicatePayments())
+        )
+
+        totals = (
+            keyed
+            | "Extract amounts"
+            >> beam.Map(lambda item: (item[0], item[1]["amount"]))
+            | "Sum per merchant and window" >> beam.CombinePerKey(sum)
+        )
+
+        return totals | "Attach window metadata" >> beam.Map(format_total)
+
+    return build_windowed_totals_pipeline
 
 
 @app.cell
@@ -225,12 +361,61 @@ def _(Any):
     ) -> Any:
         """Crear la transformación WindowInto para streaming.
 
-        Configurar un pane on-time por watermark, una estimación early por
-        processing time, revisiones late y modo ACCUMULATING.
+        Configura on-time por watermark, una estimación early por processing
+        time, revisiones late y modo ACCUMULATING.
         """
-        raise NotImplementedError("TODO 6: implementar build_trigger_policy")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be greater than zero")
+        if allowed_lateness_seconds < 0:
+            raise ValueError(
+                "allowed_lateness_seconds cannot be negative"
+            )
 
-    return
+        import apache_beam as beam
+        from apache_beam.transforms import trigger
+
+        return beam.WindowInto(
+            beam.window.FixedWindows(window_seconds),
+            trigger=trigger.AfterWatermark(
+                early=trigger.AfterProcessingTime(10),
+                late=trigger.AfterCount(1),
+            ),
+            allowed_lateness=allowed_lateness_seconds,
+            accumulation_mode=trigger.AccumulationMode.ACCUMULATING,
+        )
+
+    return build_trigger_policy
+
+
+@app.cell
+def _(Any, beam):
+    class AttachPaneMetadata(beam.DoFn):
+        """Reificar metadatos de ventana y pane para evidencia/observabilidad.
+
+        Esta clase no cambia el contrato de cuatro campos exigido por
+        `build_windowed_totals_pipeline`; se usa en pruebas temporales y
+        demostraciones para hacer visible `PaneInfo`.
+        """
+
+        def process(
+            self,
+            element: Any,
+            window=beam.DoFn.WindowParam,
+            pane_info=beam.DoFn.PaneInfoParam,
+        ):
+            from apache_beam.utils.windowed_value import PaneInfoTiming
+
+            yield {
+                "value": element,
+                "window_start": window.start.to_utc_datetime().isoformat(),
+                "window_end": window.end.to_utc_datetime().isoformat(),
+                "pane_timing": PaneInfoTiming.to_string(pane_info.timing),
+                "pane_index": pane_info.index,
+                "pane_is_first": pane_info.is_first,
+                "pane_is_last": pane_info.is_last,
+            }
+
+    return AttachPaneMetadata
 
 
 @app.cell
@@ -238,23 +423,25 @@ def _(mo):
     mo.md(r"""
     ## 3. Pipeline Beam, estado y triggers
 
-    Completá:
+    La deduplicación se ejecuta después de crear la clave `merchant_id`. Beam
+    aísla el estado por clave y ventana. El `SetStateSpec` recuerda los
+    `event_id` observados y un timer en tiempo de evento programa la limpieza
+    para `window.end + allowed_lateness`.
 
-    - `build_windowed_totals_pipeline`;
-    - `DeduplicatePayments.process`;
-    - `build_trigger_policy`.
+    La política temporal usa `AfterWatermark` con un early firing estimado a
+    los 10 segundos de processing time y un late firing por cada nuevo elemento.
+    Los panes son `ACCUMULATING`, de modo que cada revisión representa el total
+    completo de la ventana y puede reemplazar la versión anterior downstream.
 
-    La clave debe ser `merchant_id` antes de usar estado. La salida debe
-    recuperar los límites de ventana con `WindowParam`.
+    `build_windowed_totals_pipeline` mantiene el contrato exacto evaluado por la
+    cátedra (`merchant_id`, `window_start`, `window_end`, `total`). Para hacer
+    explícitos también los metadatos de pane sin alterar ese contrato,
+    `AttachPaneMetadata` reifica `PaneInfoParam` (`timing`, `index`, `is_first`
+    e `is_last`) y se utiliza como evidencia en las pruebas adicionales con
+    `TestStream`.
 
-    Agregá pruebas con `TestPipeline` y al menos una prueba temporal con
-    `TestStream` que evidencie un resultado late aceptado.
-
-    ### Expiración
-
-    Extendé la deduplicación con un timer de event time que limpie el estado
-    al finalizar la ventana más la lateness permitida. Explicá por qué un
-    estado sin expiración crece indefinidamente.
+    El timer es necesario porque un estado sin expiración crecería con cada
+    nuevo `event_id`, aumentando memoria, checkpoints y costo operativo.
     """)
     return
 
@@ -263,7 +450,7 @@ def _(mo):
 def _(Any):
     def make_idempotency_key(result: dict[str, Any]) -> str:
         """Construir merchant_id|window_start para un resultado lógico."""
-        raise NotImplementedError("TODO 7: implementar make_idempotency_key")
+        return f'{result["merchant_id"]}|{result["window_start"]}'
 
     def simulate_sink_retries(
         results: list[dict[str, Any]],
@@ -273,60 +460,61 @@ def _(Any):
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Simular intentos de escritura y retornar `(materialized, audit)`.
 
-        En modo idempotente, múltiples intentos del mismo resultado deben dejar
-        una sola fila materializada. En modo append, cada intento agrega una.
+        En modo idempotente, múltiples intentos del mismo resultado dejan una
+        sola fila materializada. En modo append, cada intento agrega una fila.
         """
-        raise NotImplementedError("TODO 8: implementar simulate_sink_retries")
+        if attempts < 0:
+            raise ValueError("attempts cannot be negative")
 
-    return
+        append_sink: list[dict[str, Any]] = []
+        upsert_sink: dict[str, dict[str, Any]] = {}
+        audit: list[dict[str, Any]] = []
+        operation = "UPSERT" if idempotent else "POST"
+
+        for result in results:
+            idempotency_key = make_idempotency_key(result)
+            row = {
+                **result,
+                "idempotency_key": idempotency_key,
+            }
+
+            for attempt in range(1, attempts + 1):
+                audit.append(
+                    {
+                        **row,
+                        "attempt": attempt,
+                        "operation": operation,
+                    }
+                )
+
+                if idempotent:
+                    upsert_sink[idempotency_key] = dict(row)
+                else:
+                    append_sink.append(dict(row))
+
+        materialized = (
+            list(upsert_sink.values()) if idempotent else append_sink
+        )
+        return materialized, audit
+
+    return make_idempotency_key, simulate_sink_retries
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 4. Efectos externos
+    ## 4. Efectos externos e idempotencia
 
-    Completá `make_idempotency_key` y `simulate_sink_retries`.
+    El sink se modela con dos contratos:
 
-    En este ejercicio los sinks **no son servicios externos reales**. Son
-    estructuras Python en memoria que representan dos contratos de escritura:
-
-    | Modo simulado | Estructura interna | Operación |
+    | Modo | Operación | Consecuencia de dos intentos |
     |---|---|---|
-    | `POST` append-only | `list` | `append(row)` en cada intento |
-    | `UPSERT` idempotente | `dict` | `sink[idempotency_key] = row` |
+    | `POST` append-only | `append(row)` | dos filas visibles |
+    | `UPSERT` idempotente | `sink[key] = row` | una entidad lógica |
 
-    `simulate_sink_retries` siempre retorna dos **listas**:
-
-    1. `materialized`: estado final visible del sink;
-    2. `audit`: todos los intentos realizados.
-
-    En modo append-only, `materialized` contiene una fila por intento. En modo
-    idempotente, se usa internamente un diccionario y al final se retornan
-    `list(upsert_sink.values())`.
-
-    Para cuatro resultados y dos intentos existen ocho filas de auditoría. El
-    modo append-only materializa ocho filas; el UPSERT materializa cuatro
-    porque el segundo intento reemplaza la misma clave lógica.
-
-    ## 5. Pruebas obligatorias
-
-    El proyecto ya incluye los tests. Ejecutalos con:
-
-    ```bash
-    uv run pytest
-    ```
-
-    Al comienzo deben fallar con `NotImplementedError`. Implementá las
-    funciones hasta que estas garantías queden verdes:
-
-    - [ ] un duplicado no modifica el total;
-    - [ ] claves distintas no comparten estado;
-    - [ ] un evento fuera de orden cae en su ventana de evento;
-    - [ ] un evento con atraso aceptado produce una revisión;
-    - [ ] un evento demasiado tardío queda auditado;
-    - [ ] dos escrituras del mismo resultado dejan una sola entidad;
-    - [ ] el timer limpia el estado cuando corresponde.
+    La clave `merchant_id|window_start` representa el mismo efecto lógico para
+    reintentos y para revisiones acumulativas de una ventana. Así, una nueva
+    revisión reemplaza el total anterior en lugar de crear otra entidad.
     """)
     return
 
@@ -334,28 +522,21 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Entrega
+    ## 5. Verificación
 
-    Publicá un repositorio propio con:
+    Ejecutar desde el repositorio:
 
-    1. este notebook completamente implementado;
-    2. la suite de pruebas provista ejecutada y completamente verde;
-    3. README con instrucciones Docker o `uv`;
-    4. explicación breve de ventanas, triggers, estado, timer e
-       idempotencia;
-    5. evidencia de ejecución y resultados.
+    ```bash
+    uv sync --frozen
+    uv run pytest
+    uv run ruff check notebook.py
+    uv run marimo check --strict notebook.py
+    ```
 
-    ### Criterios sugeridos
-
-    | Criterio | Peso |
-    |---|---:|
-    | Contrato temporal y ventanas | 25% |
-    | Estado, deduplicación y expiración | 25% |
-    | Idempotencia y reintentos | 20% |
-    | Pruebas y casos límite | 20% |
-    | Reproducibilidad y explicación | 10% |
-
-    Se evalúa corrección conceptual y evidencia, no complejidad innecesaria.
+    Además de la suite provista, se incluye una prueba con `TestStream` para
+    demostrar que un evento con timestamp perteneciente a una ventana cerrada
+    puede llegar después de que el watermark cruza el final de esa ventana y
+    aun producir una revisión mientras permanezca dentro de `allowed_lateness`.
     """)
     return
 
